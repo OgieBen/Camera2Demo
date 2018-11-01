@@ -3,12 +3,16 @@ package com.ravenshell.camera2demo;
 
 import android.app.Activity;
 import android.content.Context;
+import android.content.res.Configuration;
 import android.graphics.ImageFormat;
+import android.graphics.Point;
+import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.Image;
 import android.media.ImageReader;
 import android.os.Bundle;
 import android.os.Handler;
@@ -18,12 +22,19 @@ import android.support.v4.app.Fragment;
 import android.util.Log;
 import android.util.Size;
 import android.view.LayoutInflater;
+import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.Semaphore;
 
 
@@ -40,6 +51,77 @@ public class Camera2Fragment extends Fragment {
 
     private Semaphore cameraLock = new Semaphore(1);
     private CameraDevice cameraDevice;
+    private File mfile;
+    private int sensorOrientation;
+    private boolean isRotated = false;
+
+
+    private Size optimzedSize;
+
+    private String mCameraId;
+
+
+
+    /**
+     * Max preview width that is guaranteed by Camera2 API
+     */
+    private static final int MAX_PREVIEW_WIDTH = 1920;
+
+    /**
+     * Max preview height that is guaranteed by Camera2 API
+     */
+    private static final int MAX_PREVIEW_HEIGHT = 1080;
+
+
+    private static Size chooseOptimalSize(Size[] choices, int textureViewWidth,
+                                          int textureViewHeight, int maxWidth, int maxHeight, Size aspectRatio) {
+
+        // Collect the supported resolutions that are at least as big as the preview Surface
+        List<Size> bigEnough = new ArrayList<>();
+        // Collect the supported resolutions that are smaller than the preview Surface
+        List<Size> notBigEnough = new ArrayList<>();
+
+        int w = aspectRatio.getWidth();
+        int h = aspectRatio.getHeight();
+
+        for (Size option : choices) {
+            // check if maxHeight is greater than optionHeight and
+            // if maxWidth is greater than optionWidth
+            // check if optionHeight is equal to (optioHeight * aspecRatioHeight) / aspecRatioWidth
+            // i.e if option height is going to be equal to newHeight
+            // i.e calculate aspect ratio:
+
+            // There is a simple formula for calculating aspect ratios:
+            // aspectRatio = ( oldWidth / oldHeight ).
+            // For instance if you want to know the new height of an object,
+            // you can use: newHeight = ( newWidth / aspectRatio ),
+            // and if you need the new width of an object,
+            // you can use: newWidth = ( newHeight * aspectRatio )
+
+            if (option.getWidth() <= maxWidth && option.getHeight() <= maxHeight && option.getHeight() == option.getWidth() * h / w) {
+               // if optionHeight and optionWidth are greater than textureViewWidth(or previewWidth)
+                // and textureViewHeight add option to bigEnough array add to notBigEnough
+                // array otherwise
+                if (option.getWidth() >= textureViewWidth && option.getHeight() >= textureViewHeight) {
+                    bigEnough.add(option);
+                } else {
+                    notBigEnough.add(option);
+                }
+            }
+        }
+
+        // Pick the smallest of those big enough. If there is no one big enough, pick the
+        // largest of those not big enough.
+        if (bigEnough.size() > 0) {
+            return Collections.min(bigEnough, new CompareSizesByArea());
+        } else if (notBigEnough.size() > 0) {
+            return Collections.max(notBigEnough, new CompareSizesByArea());
+        } else {
+            Log.e("Preview Error", "Couldn't find any suitable preview size");
+            return choices[0];
+        }
+    }
+
     private CameraDevice.StateCallback cameraDeviceCallback = new CameraDevice.StateCallback() {
         @Override
         public void onOpened(@NonNull CameraDevice _cameraDevice) {
@@ -69,6 +151,15 @@ public class Camera2Fragment extends Fragment {
             if (activity != null) {
                 activity.finish();
             }
+        }
+    };
+
+    // This callback is triggered when there is a still image to be saved by ImageReader
+    private ImageReader.OnImageAvailableListener onImageAvailableListener = new ImageReader.OnImageAvailableListener() {
+        @Override
+        public void onImageAvailable(ImageReader imageReader) {
+            // save new Image on another thread
+            mBackgroundHandler.post(new  ImageSaver(imageReader.acquireNextImage(), mfile));
         }
     };
 
@@ -198,7 +289,12 @@ public class Camera2Fragment extends Fragment {
                 // data is not necessary, compared to ImageReaders using other format such as YUV_420_888.
 
                 ImageReader reader = ImageReader.newInstance(largest.getWidth(), largest.getWidth(), ImageFormat.JPEG, 2);
+                reader.setOnImageAvailableListener(onImageAvailableListener, mBackgroundHandler);
 
+
+                onRotationSwap(activity, cameraCharacteristics);
+
+                mCameraId = cameraId;
 
             }
         } catch (NullPointerException e) {
@@ -207,6 +303,79 @@ public class Camera2Fragment extends Fragment {
 
         }
     }
+
+
+    private void onRotationSwap(Activity activity, CameraCharacteristics cameraCharacteristics){
+        int rotation = activity.getWindowManager().getDefaultDisplay().getRotation();
+
+        sensorOrientation = cameraCharacteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+
+        switch(rotation){
+            case Surface.ROTATION_0:
+            case Surface.ROTATION_180:
+                if(sensorOrientation == 90 || sensorOrientation == 270){
+                    isRotated = true;
+                }
+                break;
+            case Surface.ROTATION_90:
+            case Surface.ROTATION_270:
+                if(sensorOrientation == 0 || sensorOrientation == 180){
+                    isRotated = false;
+                }
+                break;
+            default: Log.e("Rotation Error", "Invalid Rotation");
+        }
+
+    }
+
+    public void setDimensions(Activity activity, StreamConfigurationMap map, int width, int height, Size largest){
+        Point displaySize = new Point();
+        activity.getWindowManager().getDefaultDisplay().getSize(displaySize);
+
+        int previewHeight = height;
+        int previewWidth = width;
+
+        int maxPreviewHeight = displaySize.y;
+        int maxPreviewWidth = displaySize.x;
+
+        // if screen is rotated
+        // width becomes height
+        // height becomes width
+
+        if (isRotated){
+            previewHeight = width;
+            previewWidth = height;
+            maxPreviewHeight = maxPreviewWidth;
+            maxPreviewWidth = maxPreviewHeight;
+        }
+
+        if( maxPreviewHeight > MAX_PREVIEW_HEIGHT){
+            maxPreviewHeight = MAX_PREVIEW_HEIGHT;
+        }
+
+        if(maxPreviewHeight > MAX_PREVIEW_WIDTH){
+            maxPreviewWidth = MAX_PREVIEW_WIDTH;
+        }
+
+        // Danger, W.R.! Attempting to use too large a preview size could  exceed the camera
+        // bus' bandwidth limitation, resulting in gorgeous previews but the storage of
+        // garbage capture data.
+        optimzedSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture.class),
+                previewWidth, previewHeight, maxPreviewWidth,
+                maxPreviewHeight, largest);
+
+        int currentOrientation = getResources().getConfiguration().orientation;
+        if (currentOrientation == Configuration.ORIENTATION_LANDSCAPE){
+            // set Texture aspoect Ratio Here
+
+        }else{
+            // swap height for width and width for height
+
+        }
+
+
+    }
+
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -233,6 +402,50 @@ public class Camera2Fragment extends Fragment {
             return Long.signum(
                     (long) lhs.getWidth() * lhs.getHeight() - (long) rhs.getWidth() * rhs.getHeight());
         }
+    }
+
+    /**
+     * Saves a JPEG {@link Image} into the specified {@link File}.
+     */
+    private static class ImageSaver implements Runnable {
+
+        /**
+         * The JPEG image
+         */
+        private final Image mImage;
+        /**
+         * The file we save the image into.
+         */
+        private final File mFile;
+
+        ImageSaver(Image image, File file) {
+            mImage = image;
+            mFile = file;
+        }
+
+        @Override
+        public void run() {
+            ByteBuffer buffer = mImage.getPlanes()[0].getBuffer();
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            FileOutputStream output = null;
+            try {
+                output = new FileOutputStream(mFile);
+                output.write(bytes);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } finally {
+                mImage.close();
+                if (null != output) {
+                    try {
+                        output.close();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        }
+
     }
 
 }
