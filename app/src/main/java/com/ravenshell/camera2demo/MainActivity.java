@@ -1,8 +1,6 @@
 package com.ravenshell.camera2demo;
 
-import android.hardware.camera2.CameraDevice;
 import android.os.Bundle;
-import android.support.annotation.NonNull;
 import android.support.v4.app.FragmentManager;
 import android.support.v4.app.FragmentTransaction;
 import android.support.v7.app.AppCompatActivity;
@@ -25,7 +23,7 @@ public class MainActivity extends AppCompatActivity {
 
         FragmentManager manager = getSupportFragmentManager();
         FragmentTransaction transaction = manager.beginTransaction();
-        transaction.replace(R.id.contianer, Camera2Fragment.newInstance());
+        transaction.replace(R.id.container, Camera2Fragment.newInstance());
         transaction.commit();
 
     }

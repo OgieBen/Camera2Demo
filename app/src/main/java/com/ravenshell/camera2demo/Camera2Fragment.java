@@ -1,16 +1,24 @@
 package com.ravenshell.camera2demo;
 
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.ImageFormat;
+import android.graphics.Matrix;
 import android.graphics.Point;
+import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
+import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
@@ -18,13 +26,19 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.support.v4.app.Fragment;
+import android.support.v4.content.ContextCompat;
 import android.util.Log;
 import android.util.Size;
 import android.view.LayoutInflater;
 import android.view.Surface;
+import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.Toast;
+
+import com.ravenshell.camera2demo.view.PreviewTextureView;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -36,6 +50,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 
 /**
@@ -49,6 +64,7 @@ public class Camera2Fragment extends Fragment {
     private Handler mBackgroundHandler;
     private HandlerThread mBackgroundThread;
 
+    private ImageReader imageReader;
     private Semaphore cameraLock = new Semaphore(1);
     private CameraDevice cameraDevice;
     private File mfile;
@@ -59,6 +75,14 @@ public class Camera2Fragment extends Fragment {
     private Size optimzedSize;
 
     private String mCameraId;
+
+    private PreviewTextureView textureView;
+
+    private final int  CAMERA_PERMISSION = 3;
+
+    private CaptureRequest.Builder previewCaptureRequestBuilder;
+    private CaptureRequest previewCaptureRequest;
+    private CameraCaptureSession cameraCaptureSession;
 
 
 
@@ -71,6 +95,34 @@ public class Camera2Fragment extends Fragment {
      * Max preview height that is guaranteed by Camera2 API
      */
     private static final int MAX_PREVIEW_HEIGHT = 1080;
+
+    /**
+     * {@link TextureView.SurfaceTextureListener} handles several lifecycle events on a
+     * {@link TextureView}.
+     */
+    private final TextureView.SurfaceTextureListener surfaceTextureListener
+            = new TextureView.SurfaceTextureListener() {
+
+        @Override
+        public void onSurfaceTextureAvailable(SurfaceTexture texture, int width, int height) {
+            openCamera(width, height);
+        }
+
+        @Override
+        public void onSurfaceTextureSizeChanged(SurfaceTexture texture, int width, int height) {
+            configureTransform(width, height);
+        }
+
+        @Override
+        public boolean onSurfaceTextureDestroyed(SurfaceTexture texture) {
+            return true;
+        }
+
+        @Override
+        public void onSurfaceTextureUpdated(SurfaceTexture texture) {
+        }
+
+    };
 
 
     private static Size chooseOptimalSize(Size[] choices, int textureViewWidth,
@@ -129,6 +181,7 @@ public class Camera2Fragment extends Fragment {
             cameraDevice = _cameraDevice;
 
             // create camera preview session here
+            cameraPreview();
 
         }
 
@@ -199,7 +252,7 @@ public class Camera2Fragment extends Fragment {
         }
     }
 
-    private void cameraSetup() {
+    private void cameraSetup(int width, int height) {
         Activity activity = getActivity();
         // Acquire CameraManager through getSystemService() method from current activity
         CameraManager cameraManager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
@@ -288,11 +341,11 @@ public class Camera2Fragment extends Fragment {
                 //  are more efficient to use when application access to image
                 // data is not necessary, compared to ImageReaders using other format such as YUV_420_888.
 
-                ImageReader reader = ImageReader.newInstance(largest.getWidth(), largest.getWidth(), ImageFormat.JPEG, 2);
-                reader.setOnImageAvailableListener(onImageAvailableListener, mBackgroundHandler);
+                imageReader = ImageReader.newInstance(largest.getWidth(), largest.getWidth(), ImageFormat.JPEG, 2);
+                imageReader.setOnImageAvailableListener(onImageAvailableListener, mBackgroundHandler);
 
 
-                onRotationSwap(activity, cameraCharacteristics);
+                onRotationSwap(activity, cameraCharacteristics, map, largest, width, height);
 
                 mCameraId = cameraId;
 
@@ -305,7 +358,7 @@ public class Camera2Fragment extends Fragment {
     }
 
 
-    private void onRotationSwap(Activity activity, CameraCharacteristics cameraCharacteristics){
+    private void onRotationSwap(Activity activity, CameraCharacteristics cameraCharacteristics, StreamConfigurationMap map, Size largest, int width, int height){
         int rotation = activity.getWindowManager().getDefaultDisplay().getRotation();
 
         sensorOrientation = cameraCharacteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
@@ -325,6 +378,8 @@ public class Camera2Fragment extends Fragment {
                 break;
             default: Log.e("Rotation Error", "Invalid Rotation");
         }
+
+        setDimensions(activity, map, width, height, largest);
 
     }
 
@@ -367,15 +422,154 @@ public class Camera2Fragment extends Fragment {
         int currentOrientation = getResources().getConfiguration().orientation;
         if (currentOrientation == Configuration.ORIENTATION_LANDSCAPE){
             // set Texture aspoect Ratio Here
-
+            textureView.setAspectRatio(optimzedSize.getWidth(), optimzedSize.getHeight());
         }else{
             // swap height for width and width for height
-
+            textureView.setAspectRatio(optimzedSize.getHeight(), optimzedSize.getWidth());
         }
 
 
     }
 
+    private void configureTransform(int viewWidth, int viewHeight) {
+        Activity activity = getActivity();
+        if (null == textureView || null == optimzedSize|| null == activity) {
+            return;
+        }
+        int rotation = activity.getWindowManager().getDefaultDisplay().getRotation();
+
+        Matrix matrix = new Matrix();
+        RectF viewRect = new RectF(0, 0, viewWidth, viewHeight);
+        RectF bufferRect = new RectF(0, 0, optimzedSize.getHeight(), optimzedSize.getWidth());
+
+        float centerX = viewRect.centerX();
+        float centerY = viewRect.centerY();
+
+        // rotate matrix accordinly
+        if (Surface.ROTATION_90 == rotation || Surface.ROTATION_270 == rotation) {
+
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY());
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
+
+            float scale = Math.max(
+                    (float) viewHeight / optimzedSize.getHeight(),
+                    (float) viewWidth / optimzedSize.getWidth());
+
+            matrix.postScale(scale, scale, centerX, centerY);
+            matrix.postRotate(90 * (rotation - 2), centerX, centerY);
+
+        } else if (Surface.ROTATION_180 == rotation) {
+            matrix.postRotate(180, centerX, centerY);
+        }
+        textureView.setTransform(matrix);
+    }
+
+    private void requestCameraPermission(){
+        requestPermissions(new String[]{Manifest.permission.CAMERA}, CAMERA_PERMISSION);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+
+        if (requestCode == CAMERA_PERMISSION) {
+            if (grantResults.length != 1 || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+                Toast.makeText(getActivity(), "Error get Camera permission", Toast.LENGTH_SHORT).show();
+            }
+        } else {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        }
+    }
+
+    private void openCamera(int width, int height){
+
+        if(ContextCompat.checkSelfPermission(getActivity(), Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED){
+            requestCameraPermission();
+            return;
+        }
+
+        Activity activity = getActivity();
+        cameraSetup(width, height);
+        configureTransform(width, height);
+
+        try{
+
+            CameraManager manager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
+
+            if(!cameraLock.tryAcquire(2000, TimeUnit.MILLISECONDS)){
+                throw new RuntimeException("Timedout waiting for lock");
+            }
+            manager.openCamera(mCameraId, cameraDeviceCallback, mBackgroundHandler);
+
+        }catch(CameraAccessException e){
+            Log.e("Camera Error", "Could not open camera "+ e.getMessage());
+        }catch (InterruptedException e){
+            Log.e("Camera Error", "Could not open camera "+ e.getMessage());
+        }
+
+
+    }
+
+    private void cameraPreview(){
+
+        try {
+            SurfaceTexture texture = textureView.getSurfaceTexture();
+            if (texture == null) {
+                return;
+            }
+
+            texture.setDefaultBufferSize(optimzedSize.getWidth(), optimzedSize.getHeight());
+
+            Surface surface = new Surface(texture);
+
+            previewCaptureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            previewCaptureRequestBuilder.addTarget(surface);
+
+            cameraDevice.createCaptureSession(Arrays.asList(surface, imageReader.getSurface()),
+                    new CameraCaptureSession.StateCallback() {
+                @Override
+                public void onConfigured(@NonNull CameraCaptureSession _cameraCaptureSession) {
+                    cameraCaptureSession = _cameraCaptureSession;
+
+                    try{
+
+                        previewCaptureRequest = previewCaptureRequestBuilder.build();
+                        cameraCaptureSession.setRepeatingRequest(previewCaptureRequest, new CameraCaptureSession.CaptureCallback() {
+                            @Override
+                            public void onCaptureProgressed(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull CaptureResult partialResult) {
+                                super.onCaptureProgressed(session, request, partialResult);
+                            }
+
+                            @Override
+                            public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
+                                super.onCaptureCompleted(session, request, result);
+                            }
+                        }, mBackgroundHandler);
+
+                    }catch (CameraAccessException e){
+                        displayToastMsg("Could not access camera for capture session");
+
+                    }
+
+                }
+
+                @Override
+                public void onConfigureFailed(@NonNull CameraCaptureSession cameraCaptureSession) {
+                    displayToastMsg("Failed to create capture session");
+                }
+            }, null);
+
+
+
+
+
+        }catch (CameraAccessException e){
+            displayToastMsg("Could not create camera preview");
+        }
+    }
+
+    private void displayToastMsg(String msg){
+        Toast.makeText(getActivity(), msg, Toast.LENGTH_LONG).show();
+    }
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -383,11 +577,42 @@ public class Camera2Fragment extends Fragment {
 
     }
 
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        startBackground();
+
+        // When the screen is turned off and turned back on, the SurfaceTexture is already
+        // available, and "onSurfaceTextureAvailable" will not be called. In that case, we can open
+        // a camera and start preview from here (otherwise, we wait until the surface is ready in
+        // the SurfaceTextureListener).
+        if (textureView.isAvailable()) {
+            openCamera(textureView.getWidth(), textureView.getHeight());
+        } else {
+            textureView.setSurfaceTextureListener(surfaceTextureListener);
+        }
+    }
+
     @Override
     public View onCreateView(LayoutInflater inflater, ViewGroup container,
                              Bundle savedInstanceState) {
         // Inflate the layout for this fragment
         return inflater.inflate(R.layout.fragment_camera2, container, false);
+    }
+
+
+    @Override
+    public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
+        super.onViewCreated(view, savedInstanceState);
+
+        textureView = view.findViewById(R.id.texture_view);
+    }
+
+    @Override
+    public void onActivityCreated(@Nullable Bundle savedInstanceState) {
+        super.onActivityCreated(savedInstanceState);
+        mfile = new File(getActivity().getExternalFilesDir(null), "preview.jpg");
     }
 
     /**
